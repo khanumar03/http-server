@@ -1,0 +1,9 @@
+build/
+bin/
+obj/
+
+server
+*.o
+*.out
+
+.vscode/
