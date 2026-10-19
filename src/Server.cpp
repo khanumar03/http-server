@@ -5,104 +5,212 @@
 #include <arpa/inet.h>
 #include <sstream>
 #include <algorithm>
+#include <thread>
+#include <netinet/tcp.h>
+#include <sys/time.h>
 
-Server::Server(int port, Router& router) : port(port), router(router) {}
+Server::Server(int port, Router &router) : port(port), router(router)
+{
+    unsigned int num_workers = std::thread::hardware_concurrency();
+    if (num_workers == 0)
+        num_workers = 4;
 
-Server::~Server() {
-    if (server_fd != -1) close(server_fd);
+    workers.reserve(num_workers);
+    for (int i = 0; i < num_workers; i++)
+    {
+        workers.emplace_back(&Server::worker, this);
+    }
 }
 
-void Server::parse_request_line_and_query(const std::string& line, HttpRequest& req) {
+Server::~Server()
+{
+    {
+        std::lock_guard<std::mutex> lock(mut);
+        run = false;
+    }
+
+    cv.notify_all();
+
+    for (std::thread &w : workers)
+    {
+        if (w.joinable())
+            w.join();
+    }
+    if (server_fd != -1)
+        close(server_fd);
+}
+
+void Server::worker()
+{
+    while (run)
+    {
+        int fd = -1;
+
+        {
+            std::unique_lock<std::mutex> lock(mut);
+            cv.wait(lock, [this]()
+                    { return !connections.empty() || !run; });
+
+            if (!connections.empty())
+            {
+
+                fd = connections.front();
+                connections.pop();
+            }
+        }
+
+        if (fd != -1)
+            handle_client(fd);
+    }
+}
+
+void Server::parse_request_line_and_query(const std::string &line, HttpRequest &req)
+{
     std::stringstream ss(line);
-    std::string raw_url;
-    ss >> req.method >> raw_url >> req.version;
+    std::string path;
+    ss >> req.method >> path >> req.version;
 
-    size_t qpos = raw_url.find('?');
-    if (qpos == std::string::npos) {
-        req.path = raw_url;
-    } else {
-        req.path = raw_url.substr(0, qpos);
-        std::stringstream qs(raw_url.substr(qpos + 1));
+    size_t qp = path.find('?');
+
+    if (qp == std::string::npos)
+        req.path = path;
+    else
+    {
+        req.path = path.substr(0, qp);
+        std::stringstream t(path.substr(qp + 1));
         std::string pair;
-        while (std::getline(qs, pair, '&')) {
-            size_t eq = pair.find('=');
-            if (eq != std::string::npos) {
-                req.query[pair.substr(0, eq)] = pair.substr(eq + 1);
-            } else if (!pair.empty()) {
-                req.query[pair] = "";
-            }
+
+        while (std::getline(t, pair, '&'))
+        {
+            if (pair.empty())
+                continue;
+
+            std::stringstream q(pair);
+            std::string key;
+            std::string val;
+            std::getline(q, key, '=');
+            std::getline(q, val);
+            req.query[key] = val;
         }
     }
 }
 
-void Server::handle_client(int c) {
-    char buffer[512];
-    std::string data = "";
-    ssize_t buf = 0;
-    size_t hep = std::string::npos;
+void Server::handle_client(int client_fd)
+{
+    char buffer[4096];
+    std::string unparsed_data;
 
-    // Phase 1: Read headers
-    while ((hep = data.find("\r\n\r\n")) == std::string::npos) {
-        buf = read(c, buffer, sizeof(buffer));
-        if (buf <= 0) break;
-        data.append(buffer, buf);
-    }
+    while (true)
+    {
+        size_t hep = unparsed_data.find("\r\n\r\n");
 
-    if (hep == std::string::npos) {
-        close(c);
-        return;
-    }
+        while (hep == std::string::npos)
+        {
+            ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer));
+            if (bytes_read <= 0)
+            {
+                close(client_fd);
+                return;
+            }
+            unparsed_data.append(buffer, bytes_read);
+            hep = unparsed_data.find("\r\n\r\n");
+        }
 
-    HttpRequest req;
-    HttpResponse res;
-    req.body = data.substr(hep + 4);
+        std::string header_section = unparsed_data.substr(0, hep);
+        unparsed_data.erase(0, hep + 4);
 
-    // Phase 2: Parse header lines
-    std::vector<std::string> raw_headers;
-    size_t start = 0, end = 0;
-    while ((end = data.find("\r\n", start)) != std::string::npos) {
-        if (start == end) break;
-        raw_headers.push_back(data.substr(start, end - start));
-        start = end + 2;
-    }
+        HttpRequest req;
+        HttpResponse res;
 
-    if (!raw_headers.empty()) {
+        std::vector<std::string> raw_headers;
+        size_t start = 0, end = 0;
+        while ((end = header_section.find("\r\n", start)) != std::string::npos)
+        {
+            if (start == end)
+                break;
+            raw_headers.push_back(header_section.substr(start, end - start));
+            start = end + 2;
+        }
+        if (start < header_section.size())
+        {
+            raw_headers.push_back(header_section.substr(start));
+        }
+
+        if (raw_headers.empty())
+        {
+            close(client_fd);
+            return;
+        }
+
         parse_request_line_and_query(raw_headers[0], req);
-    }
 
-    size_t content_length = 0;
-    for (size_t i = 1; i < raw_headers.size(); ++i) {
-        size_t colon = raw_headers[i].find(':');
-        if (colon != std::string::npos) {
-            std::string k = raw_headers[i].substr(0, colon);
-            std::string v = raw_headers[i].substr(raw_headers[i].find_first_not_of(" \t", colon + 1));
-            req.set_header(k, v);
-            if (k == "Content-Length") {
-                try { content_length = std::stoul(v); } catch (...) { content_length = 0; }
+        size_t content_length = 0;
+        std::string Connection = "";
+
+        for (size_t i = 1; i < raw_headers.size(); i++)
+        {
+            size_t colon = raw_headers[i].find(':');
+            if (colon != std::string::npos)
+            {
+                std::string k = raw_headers[i].substr(0, colon);
+                std::string v = raw_headers[i].substr(raw_headers[i].find_first_not_of(" \t", colon + 1));
+                req.set_header(k, v);
+
+                if (k == "Content-Length")
+                {
+                    try
+                    {
+                        content_length = std::stoul(v);
+                    }
+                    catch (...)
+                    {
+                        content_length = 0;
+                    }
+                }
+                else if (k == "Connection")
+                {
+                    Connection = v;
+                }
             }
         }
-    }
 
-    // Phase 3: Drain remaining body bytes
-    if (content_length > req.body.size()) {
-        content_length -= req.body.size();
-        while (content_length > 0) {
-            size_t to_read = std::min((size_t)sizeof(buffer), content_length);
-            buf = read(c, buffer, to_read);
-            if (buf <= 0) break;
-            req.body.append(buffer, buf);
-            content_length -= buf;
+        while (unparsed_data.size() < content_length)
+        {
+            size_t needed = content_length - unparsed_data.size();
+            size_t to_read = std::min((size_t)sizeof(buffer), needed);
+            ssize_t bytes_read = read(client_fd, buffer, to_read);
+            if (bytes_read <= 0)
+            {
+                close(client_fd);
+                return;
+            }
+            unparsed_data.append(buffer, bytes_read);
         }
-    }
 
-    // Phase 4: Route and Respond
-    router.handle(req, res);
-    std::string out = res.serialize();
-    send(c, out.data(), out.size(), 0);
-    close(c);
+        req.body = unparsed_data.substr(0, content_length);
+        unparsed_data.erase(0, content_length);
+
+        std::string conn_lower = Connection;
+        std::transform(conn_lower.begin(), conn_lower.end(), conn_lower.begin(), ::tolower);
+
+        bool keep_alive = true;
+        if (conn_lower == "close" || (req.version == "HTTP/1.0" && conn_lower != "keep-alive"))
+            keep_alive = false;
+
+        router.handle(req, res);
+        res.set_header("Content-Length", std::to_string(res.body.size()));
+        res.set_header("Connection", keep_alive ? "keep-alive" : "close");
+        std::string out = res.serialize();
+        send(client_fd, out.data(), out.size(), 0);
+
+        if (!keep_alive)
+            break;
+    }
+    close(client_fd);
 }
 
-void Server::start() {
+void Server::start()
+{
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -113,16 +221,29 @@ void Server::start() {
     addr.sin_addr.s_addr = INADDR_ANY;
 
     bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));
-    listen(server_fd, 10);
+    listen(server_fd, SOMAXCONN);
 
     std::cout << "Server listening on port " << port << std::endl;
 
-    while (true) {
-        sockaddr_in client{};
-        socklen_t c_size = sizeof(client);
-        int c = accept(server_fd, (struct sockaddr *)&client, &c_size);
-        if (c == -1) continue;
+    while (true)
+    {
+        sockaddr_in client_sock{};
+        socklen_t size_c = sizeof(client_sock);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_sock, &size_c);
+        if (client_fd == -1)
+            continue;
+        int f = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 500;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-        handle_client(c);
+        {
+            std::lock_guard<std::mutex> lock(mut);
+            connections.push(client_fd);
+        }
+
+        cv.notify_one();
     }
 }

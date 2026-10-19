@@ -20,7 +20,6 @@ void HttpResponse::set_status(int code, const std::string& text) {
 
 void HttpResponse::send(const std::string& text) {
     body = text;
-    set_header("Content-Type", "text/plain");
 }
 
 void HttpResponse::json(const std::string& json_str) {
@@ -33,8 +32,7 @@ std::string HttpResponse::serialize() const {
     for (const auto& [k, v] : headers) {
         res += k + ": " + v + "\r\n";
     }
-    res += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-    res += "Connection: close\r\n\r\n";
+    res += "\r\n";
     res += body;
     return res;
 }

@@ -1,53 +1,72 @@
 #include "Router.hpp"
 #include <sstream>
+#include <iostream>
 
-void Router::get(const std::string &path, Handler handler) {
+void Router::get(const std::string &path, Handler handler)
+{
     routes.push_back({"GET", path, handler});
 }
 
-void Router::post(const std::string &path, Handler handler) {
+void Router::post(const std::string &path, Handler handler)
+{
     routes.push_back({"POST", path, handler});
 }
 
-std::vector<std::string> Router::split_path(const std::string& path) {
-    std::vector<std::string> parts;
+std::vector<std::string> Router::split_path(const std::string &path)
+{
+    std::vector<std::string> sub_paths;
     std::stringstream ss(path);
-    std::string seg;
-    while (std::getline(ss, seg, '/')) {
-        if (!seg.empty()) parts.push_back(seg);
+    std::string buf;
+
+    while (std::getline(ss, buf, '/'))
+    {
+        if (!buf.empty()) {
+            sub_paths.push_back(buf);
+        }
     }
-    return parts;
+
+    return sub_paths;
 }
 
-bool Router::match(const std::string& pattern, const std::string& actual_path, 
-                   std::unordered_map<std::string, std::string>& params) {
-    auto pattern_parts = split_path(pattern);
-    auto actual_parts = split_path(actual_path);
+bool Router::match(const std::string &path, const std::string &actual_path, std::unordered_map<std::string, std::string> &params)
+{
+    std::vector<std::string> client_sub_paths = split_path(path);
+    std::vector<std::string> server_sub_paths = split_path(actual_path);
 
-    if (pattern_parts.size() != actual_parts.size()) return false;
+    if (client_sub_paths.size() != server_sub_paths.size())
+        return false;
 
-    std::unordered_map<std::string, std::string> matched_params;
+    int n = client_sub_paths.size();
+    std::unordered_map<std::string, std::string> _params;
 
-    for (size_t i = 0; i < pattern_parts.size(); ++i) {
-        if (pattern_parts[i].rfind(":", 0) == 0) {
-            matched_params[pattern_parts[i].substr(1)] = actual_parts[i];
-        } else if (pattern_parts[i] != actual_parts[i]) {
+    for (int i = 0; i < n; i++)
+    {
+        if (!server_sub_paths[i].empty() && server_sub_paths[i][0] == ':')
+        {
+            std::string key = server_sub_paths[i].substr(1);
+            _params[key] = client_sub_paths[i];
+        }
+        else if (client_sub_paths[i] != server_sub_paths[i])
+        {
             return false;
         }
     }
 
-    params = std::move(matched_params);
+    params = std::move(_params);
     return true;
 }
 
-void Router::handle(HttpRequest &req, HttpResponse &res) {
-    for (const auto &route : routes) {
-        if (route.method == req.method && match(route.path, req.path, req.params)) {
+void Router::handle(HttpRequest &req, HttpResponse &res)
+{
+    for (auto &route : routes)
+    {
+        if (req.method == route.method && match(req.path, route.path, req.params))
+        {
             route.handler(req, res);
             return;
         }
     }
 
-    res.set_status(404, "Not Found");
-    res.send("Cannot " + req.method + " " + req.path);
+    res.set_status(404, "Not found");
+    res.send("something went wrong");
 }
