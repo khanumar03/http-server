@@ -8,6 +8,9 @@
 #include <thread>
 #include <netinet/tcp.h>
 #include <sys/time.h>
+#include <sys/epoll.h>
+#include <cstring>
+#include <iterator>
 
 Server::Server(int port, Router &router) : port(port), router(router)
 {
@@ -211,9 +214,10 @@ void Server::handle_client(int client_fd)
 
 void Server::start()
 {
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -223,27 +227,98 @@ void Server::start()
     bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));
     listen(server_fd, SOMAXCONN);
 
+    int epc = epoll_create1(0);
+    struct epoll_event epe{};
+    epe.events = EPOLLIN;
+    epe.data.fd = server_fd;
+    epoll_ctl(epc, EPOLL_CTL_ADD, server_fd, &epe);
+
     std::cout << "Server listening on port " << port << std::endl;
+
+    epoll_event events[1024];
 
     while (true)
     {
-        sockaddr_in client_sock{};
-        socklen_t size_c = sizeof(client_sock);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_sock, &size_c);
-        if (client_fd == -1)
-            continue;
-        int f = 1;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 500;
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
+        int n = epoll_wait(epc, events, std::size(events), 1000);
+        if (n < 0)
         {
-            std::lock_guard<std::mutex> lock(mut);
-            connections.push(client_fd);
+            if (errno == EINTR)
+                continue;
+            std::cerr << "epoll_wait failed: " << strerror(errno);
+            break;
         }
 
-        cv.notify_one();
+        for (int i = 0; i < n; i++)
+        {
+            if (events[i].data.fd == server_fd)
+            {
+
+                while (1)
+                {
+                    int client_fd = accept4(server_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+
+                    if (client_fd >= 0)
+                    {
+                        int f = 1;
+                        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
+                        struct epoll_event c_epe{};
+                        c_epe.events = EPOLLIN;
+                        c_epe.data.fd = client_fd;
+                        epoll_ctl(epc, EPOLL_CTL_ADD, client_fd, &c_epe);
+                        std::cout << "new connection" << std::endl;
+                        handle_client(c_epe.data.fd);
+                        // close(client_fd);
+                        continue;
+                    }
+                    else if (errno == EAGAIN)
+                    {
+                        // std::cout<< "queue is empty" << std::endl;
+                        break;
+                    }
+                    else if (errno == EINTR)
+                    {
+                        std::cout << "Interrupted" << std::endl;
+                        continue;
+                    }
+                    else if (errno == ECONNABORTED)
+                    {
+                        std::cout << "client close the connection" << std::endl;
+                        continue;
+                    }
+                    else if (errno == EMFILE)
+                    {
+                        std::cout << "out of fd" << std::endl;
+                        break;
+                    }
+                    else
+                    {
+                        std::cerr << "error: " << strerror(errno) << std::endl;
+                        break;
+                    }
+                }
+            }
+        }
     }
+
+    // while (true)
+    // {
+    //     sockaddr_in client_sock{};
+    //     socklen_t size_c = sizeof(client_sock);
+    //     int client_fd = accept(server_fd, (struct sockaddr *)&client_sock, &size_c);
+    //     if (client_fd == -1)
+    //         continue;
+    //     int f = 1;
+    //     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
+    //     struct timeval tv;
+    //     tv.tv_sec = 0;
+    //     tv.tv_usec = 500;
+    //     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    //     {
+    //         std::lock_guard<std::mutex> lock(mut);
+    //         connections.push(client_fd);
+    //     }
+
+    //     cv.notify_one();
+    // }
 }
